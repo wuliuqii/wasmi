@@ -22,9 +22,12 @@ use super::{
     StoreContext,
     Stored,
 };
-use crate::{collections::arena::ArenaIndex, engine::ResumableCall, Error, Val};
-use core::{fmt, fmt::Debug, num::NonZeroU32};
-use std::{boxed::Box, sync::Arc};
+use crate::{collections::arena::ArenaIndex, engine::ResumableCall, Error, Tracer, Val};
+use core::{
+    fmt::{self, Debug},
+    num::NonZeroU32,
+};
+use std::{boxed::Box, cell::RefCell, rc::Rc, sync::Arc};
 
 /// A raw index to a function entity.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -402,6 +405,36 @@ impl Func {
             inputs,
             outputs,
         )?;
+        Ok(())
+    }
+
+    /// Calls the Wasm or host function with the given inputs.
+    ///
+    /// The result is written back into the `outputs` buffer.
+    ///
+    /// # Errors
+    ///
+    /// - If the function returned a [`Error`].
+    /// - If the types of the `inputs` do not match the expected types for the
+    ///   function signature of `self`.
+    /// - If the number of input values does not match the expected number of
+    ///   inputs required by the function signature of `self`.
+    /// - If the number of output values does not match the expected number of
+    ///   outputs required by the function signature of `self`.
+    pub fn call_with_trace<T>(
+        &self,
+        mut ctx: impl AsContextMut<Data = T>,
+        inputs: &[Val],
+        outputs: &mut [Val],
+        tracer: Rc<RefCell<Tracer>>,
+    ) -> Result<(), Error> {
+        self.verify_and_prepare_inputs_outputs(ctx.as_context(), inputs, outputs)?;
+        // Note: Cloning an [`Engine`] is intentionally a cheap operation.
+        ctx.as_context()
+            .store
+            .engine()
+            .clone()
+            .execute_func_with_trace(ctx.as_context_mut(), self, inputs, outputs, tracer)?;
         Ok(())
     }
 

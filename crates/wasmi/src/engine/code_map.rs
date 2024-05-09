@@ -779,7 +779,7 @@ impl CodeMap {
 #[derive(Debug, Copy, Clone)]
 pub struct InstructionPtr {
     /// The pointer to the instruction.
-    ptr: *const Instruction,
+    pub ptr: *const Instruction,
 }
 
 /// It is safe to send an [`InstructionPtr`] to another thread.

@@ -5,8 +5,8 @@ use crate::{
 use anyhow::{anyhow, bail, Error, Result};
 use clap::Parser;
 use context::Context;
-use std::{path::Path, process};
-use wasmi::{Func, FuncType, Val};
+use std::{cell::RefCell, path::Path, process, rc::Rc};
+use wasmi::{Func, FuncType, Tracer, Val};
 
 mod args;
 mod context;
@@ -19,6 +19,8 @@ mod tests;
 fn main() -> Result<()> {
     let args = Args::parse();
     let wasm_file = args.wasm_file();
+    let tracer = Tracer::new();
+    let tracer = Rc::new(RefCell::new(tracer));
     let wasi_ctx = args.wasi_context()?;
     let mut ctx = Context::new(wasm_file, wasi_ctx, args.fuel(), args.compilation_mode())?;
     let (func_name, func) = get_invoked_func(&args, &ctx)?;
@@ -39,10 +41,31 @@ fn main() -> Result<()> {
         )
     }
 
-    match func.call(ctx.store_mut(), &func_args, &mut func_results) {
+    match func.call_with_trace(
+        ctx.store_mut(),
+        &func_args,
+        &mut func_results,
+        tracer.clone(),
+    ) {
         Ok(()) => {
             print_remaining_fuel(&args, &ctx);
             print_pretty_results(&func_results);
+
+            let mtable = (*tracer).borrow().get_mtable();
+            let etable = &tracer.borrow().etable;
+            println!();
+            for entry in etable.entries() {
+                println!("{:?}", entry);
+            }
+            println!();
+            println!("--------------------");
+            println!();
+
+            for entry in mtable.entries() {
+                println!("{:?}", entry);
+            }
+            println!();
+
             Ok(())
         }
         Err(error) => {

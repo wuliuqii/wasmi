@@ -1,6 +1,6 @@
 pub(crate) use self::stack::Stack;
 use self::{
-    instrs::{execute_instrs, CallKind, WasmOutcome},
+    instrs::{execute_instrs, execute_instrs_with_trace, CallKind, WasmOutcome},
     stack::CallFrame,
     trap::TaggedTrap,
 };
@@ -25,13 +25,16 @@ use crate::{
     FuncEntity,
     Instance,
     StoreContextMut,
+    Tracer,
 };
+
+use std::{cell::RefCell, rc::Rc};
 
 #[cfg(doc)]
 use crate::{engine::StackLimits, Store};
 
 mod instrs;
-mod stack;
+pub(crate) mod stack;
 mod trap;
 
 impl EngineInner {
@@ -56,6 +59,33 @@ impl EngineInner {
         let mut stack = self.stacks.lock().reuse_or_new();
         let results = EngineExecutor::new(&res, &mut stack)
             .execute_root_func(ctx, func, params, results)
+            .map_err(TaggedTrap::into_error);
+        self.stacks.lock().recycle(stack);
+        results
+    }
+
+    /// Executes the given [`Func`] with the given `params` and returns the `results`.
+    ///
+    /// Uses the [`StoreContextMut`] for context information about the Wasm [`Store`].
+    ///
+    /// # Errors
+    ///
+    /// If the Wasm execution traps or runs out of resources.
+    pub fn execute_func_with_trace<T, Results>(
+        &self,
+        ctx: StoreContextMut<T>,
+        func: &Func,
+        params: impl CallParams,
+        results: Results,
+        tracer: Rc<RefCell<Tracer>>,
+    ) -> Result<<Results as CallResults>::Results, Error>
+    where
+        Results: CallResults,
+    {
+        let res = self.res.read();
+        let mut stack = self.stacks.lock().reuse_or_new();
+        let results = EngineExecutor::new(&res, &mut stack)
+            .execute_root_func_with_trace(ctx, func, params, results, tracer)
             .map_err(TaggedTrap::into_error);
         self.stacks.lock().recycle(stack);
         results
@@ -253,6 +283,86 @@ impl<'engine> EngineExecutor<'engine> {
         Ok(results)
     }
 
+    /// Executes the given [`Func`] using the given `params`.
+    ///
+    /// Stores the execution result into `results` upon a successful execution.
+    ///
+    /// # Errors
+    ///
+    /// - If the given `params` do not match the expected parameters of `func`.
+    /// - If the given `results` do not match the the length of the expected results of `func`.
+    /// - When encountering a Wasm or host trap during the execution of `func`.
+    pub fn execute_root_func_with_trace<T, Results>(
+        &mut self,
+        mut ctx: StoreContextMut<T>,
+        func: &Func,
+        params: impl CallParams,
+        results: Results,
+        tracer: Rc<RefCell<Tracer>>,
+    ) -> Result<<Results as CallResults>::Results, TaggedTrap>
+    where
+        Results: CallResults,
+    {
+        self.stack.reset();
+        match ctx.as_context().store.inner.resolve_func(func) {
+            FuncEntity::Wasm(wasm_func) => {
+                // We reserve space on the stack to write the results of the root function execution.
+                let len_results = results.len_results();
+                self.stack.values.reserve(len_results)?;
+                // SAFETY: we just called reserve to fit all new values.
+                unsafe { self.stack.values.extend_zeros(len_results) };
+                let instance = *wasm_func.instance();
+                let compiled_func = wasm_func.func_body();
+                let ctx = ctx.as_context_mut();
+                let compiled_func = self
+                    .res
+                    .code_map
+                    .get(Some(ctx.store.inner.fuel_mut()), compiled_func)?;
+                let (base_ptr, frame_ptr) = self.stack.values.alloc_call_frame(compiled_func)?;
+                // Safety: We use the `base_ptr` that we just received upon allocating the new
+                //         call frame which is guaranteed to be valid for this particular operation
+                //         until deallocating the call frame again.
+                //         Also we are providing call parameters which have been checked already to
+                //         be exactly the length of the expected function arguments.
+                unsafe { self.stack.values.fill_at(base_ptr, params.call_params()) };
+                self.stack.calls.push(CallFrame::new(
+                    InstructionPtr::new(compiled_func.instrs().as_ptr()),
+                    frame_ptr,
+                    base_ptr,
+                    RegisterSpan::new(Register::from_i16(0)),
+                    instance,
+                ))?;
+                self.execute_func_with_trace(ctx, tracer)?;
+            }
+            // TODO: implement host call trace
+            FuncEntity::Host(host_func) => {
+                // The host function signature is required for properly
+                // adjusting, inspecting and manipulating the value stack.
+                let (input_types, output_types) = self
+                    .res
+                    .func_types
+                    .resolve_func_type(host_func.ty_dedup())
+                    .params_results();
+                // In case the host function returns more values than it takes
+                // we are required to extend the value stack.
+                let len_params = input_types.len();
+                let len_results = output_types.len();
+                let max_inout = len_params.max(len_results);
+                self.stack.values.reserve(max_inout)?;
+                // SAFETY: we just called reserve to fit all new values.
+                unsafe { self.stack.values.extend_zeros(max_inout) };
+                let values = &mut self.stack.values.as_slice_mut()[..len_params];
+                for (value, param) in values.iter_mut().zip(params.call_params()) {
+                    *value = param;
+                }
+                let host_func = *host_func;
+                self.dispatch_host_func(ctx.as_context_mut(), host_func, HostFuncCaller::Root)?;
+            }
+        };
+        let results = self.write_results_back(results);
+        Ok(results)
+    }
+
     /// Resumes the execution of the given [`Func`] using `params`.
     ///
     /// Stores the execution result into `results` upon a successful execution.
@@ -305,6 +415,52 @@ impl<'engine> EngineExecutor<'engine> {
             .expect("must have frame on the call stack");
         loop {
             match self.execute_compiled_func(ctx.as_context_mut(), &mut cache)? {
+                WasmOutcome::Return => {
+                    // In this case the root function has returned.
+                    // Therefore we can return from the entire execution.
+                    return Ok(());
+                }
+                WasmOutcome::Call {
+                    results,
+                    ref host_func,
+                    call_kind,
+                } => {
+                    let instance = *self
+                        .stack
+                        .calls
+                        .peek()
+                        .expect("caller must be on the stack")
+                        .instance();
+                    self.execute_host_func(&mut ctx, results, host_func, &instance, call_kind)?;
+                }
+            }
+        }
+    }
+
+    /// Executes the top most Wasm function on the [`Stack`] until the [`Stack`] is empty.
+    ///
+    /// # Errors
+    ///
+    /// When encountering a Wasm or host trap during execution.
+    #[inline(never)]
+    fn execute_func_with_trace<T>(
+        &mut self,
+        mut ctx: StoreContextMut<T>,
+        tracer: Rc<RefCell<Tracer>>,
+    ) -> Result<(), TaggedTrap> {
+        let mut cache = self
+            .stack
+            .calls
+            .peek()
+            .map(CallFrame::instance)
+            .map(InstanceCache::from)
+            .expect("must have frame on the call stack");
+        loop {
+            match self.execute_compiled_func_with_trace(
+                ctx.as_context_mut(),
+                &mut cache,
+                tracer.clone(),
+            )? {
                 WasmOutcome::Return => {
                     // In this case the root function has returned.
                     // Therefore we can return from the entire execution.
@@ -509,6 +665,40 @@ impl<'engine> EngineExecutor<'engine> {
             code_map,
             func_types,
             &mut resource_limiter,
+        )
+    }
+
+    /// Executes the given function `frame`.
+    ///
+    /// # Note
+    ///
+    /// This executes Wasm instructions until either the execution calls
+    /// into a host function or the Wasm execution has come to an end.
+    ///
+    /// # Errors
+    ///
+    /// If the Wasm execution traps.
+    #[inline(always)]
+    fn execute_compiled_func_with_trace<T>(
+        &mut self,
+        ctx: StoreContextMut<T>,
+        cache: &mut InstanceCache,
+        tracer: Rc<RefCell<Tracer>>,
+    ) -> Result<WasmOutcome, Error> {
+        let (store_inner, mut resource_limiter) = ctx.store.store_inner_and_resource_limiter_ref();
+        let value_stack = &mut self.stack.values;
+        let call_stack = &mut self.stack.calls;
+        let code_map = &self.res.code_map;
+        let func_types = &self.res.func_types;
+        execute_instrs_with_trace(
+            store_inner,
+            cache,
+            value_stack,
+            call_stack,
+            code_map,
+            func_types,
+            &mut resource_limiter,
+            tracer,
         )
     }
 

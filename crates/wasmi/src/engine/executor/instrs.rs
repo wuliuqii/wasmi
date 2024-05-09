@@ -1,3 +1,6 @@
+use core::{cell::RefMut, fmt::Debug};
+use std::{cell::RefCell, println, rc::Rc};
+
 pub use self::call::CallKind;
 use self::{call::CallOutcome, return_::ReturnOutcome};
 use crate::{
@@ -21,11 +24,15 @@ use crate::{
         func_types::FuncTypeRegistry,
         CodeMap,
     },
+    etable::{BinOp, IVal, StepInfo},
+    module::DEFAULT_MEMORY_INDEX,
     store::ResourceLimiterRef,
+    value::Val,
     Error,
     Func,
     FuncRef,
     StoreInner,
+    Tracer,
 };
 
 mod binary;
@@ -105,8 +112,49 @@ pub fn execute_instrs<'ctx, 'engine>(
     func_types: &'engine FuncTypeRegistry,
     resource_limiter: &'ctx mut ResourceLimiterRef<'ctx>,
 ) -> Result<WasmOutcome, Error> {
-    Executor::new(ctx, cache, value_stack, call_stack, code_map, func_types)
-        .execute(resource_limiter)
+    Executor::new(
+        ctx,
+        cache,
+        value_stack,
+        call_stack,
+        code_map,
+        func_types,
+        None,
+    )
+    .execute(resource_limiter)
+}
+
+/// Executes compiled function instructions until either
+///
+/// - returning from the root function
+/// - calling a host function
+/// - encountering a trap
+///
+/// # Errors
+///
+/// If the execution traps.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+pub fn execute_instrs_with_trace<'ctx, 'engine>(
+    ctx: &'ctx mut StoreInner,
+    cache: &'engine mut InstanceCache,
+    value_stack: &'engine mut ValueStack,
+    call_stack: &'engine mut CallStack,
+    code_map: &'engine CodeMap,
+    func_types: &'engine FuncTypeRegistry,
+    resource_limiter: &'ctx mut ResourceLimiterRef<'ctx>,
+    tracer: Rc<RefCell<Tracer>>,
+) -> Result<WasmOutcome, Error> {
+    Executor::new(
+        ctx,
+        cache,
+        value_stack,
+        call_stack,
+        code_map,
+        func_types,
+        Some(tracer),
+    )
+    .execute(resource_limiter)
 }
 
 /// An execution context for executing a Wasmi function frame.
@@ -147,6 +195,8 @@ struct Executor<'ctx, 'engine> {
     ///
     /// This is used to lookup Wasm function information.
     func_types: &'engine FuncTypeRegistry,
+
+    tracer: Option<Rc<RefCell<Tracer>>>,
 }
 
 impl<'ctx, 'engine> Executor<'ctx, 'engine> {
@@ -159,6 +209,7 @@ impl<'ctx, 'engine> Executor<'ctx, 'engine> {
         call_stack: &'engine mut CallStack,
         code_map: &'engine CodeMap,
         func_types: &'engine FuncTypeRegistry,
+        tracer: Option<Rc<RefCell<Tracer>>>,
     ) -> Self {
         let frame = call_stack
             .peek()
@@ -177,7 +228,52 @@ impl<'ctx, 'engine> Executor<'ctx, 'engine> {
             call_stack,
             code_map,
             func_types,
+            tracer,
         }
+    }
+
+    fn get_tracer_if_active(&self) -> Option<Rc<RefCell<Tracer>>> {
+        if self.tracer.is_some() {
+            self.tracer.clone()
+        } else {
+            None
+        }
+    }
+
+    fn execute_instruction_post(
+        &mut self,
+        pages: u32,
+        sp: FrameRegisters,
+        instruction: &Instruction,
+        tracer: &mut RefMut<Tracer>,
+    ) {
+        let step = match *instruction {
+            Instruction::I32Add(instr) => {
+                let left = IVal {
+                    val: Val::I32(self.get_register_as(instr.lhs)),
+                    addr: unsafe { sp.get_addr(instr.lhs) },
+                };
+                let right = IVal {
+                    val: Val::I32(self.get_register_as(instr.rhs)),
+                    addr: unsafe { sp.get_addr(instr.rhs) },
+                };
+                let result = IVal {
+                    val: Val::I32(self.get_register_as(instr.result)),
+                    addr: unsafe { sp.get_addr(instr.result) },
+                };
+                StepInfo::I32BinOp {
+                    class: BinOp::Add,
+                    left,
+                    right,
+                    result,
+                }
+            }
+            _ => {
+                // TODO: implement me
+                StepInfo::Unimplemented(*instruction)
+            }
+        };
+        tracer.etable.push(pages, step);
     }
 
     /// Executes the function frame until it returns or traps.
@@ -188,7 +284,26 @@ impl<'ctx, 'engine> Executor<'ctx, 'engine> {
     ) -> Result<WasmOutcome, Error> {
         use Instruction as Instr;
         loop {
-            match *self.ip.get() {
+            // let instr = self.ip.get();
+            let instr = unsafe { &*self.ip.ptr };
+            let has_default_memory = {
+                let instance = self.cache.instance();
+                self.ctx
+                    .resolve_instance(instance)
+                    .get_memory(DEFAULT_MEMORY_INDEX)
+                    .is_some()
+            };
+            let pre_sp = self.sp;
+            let pages = if has_default_memory {
+                self.ctx
+                    .resolve_memory(self.cache.default_memory(self.ctx))
+                    .current_pages()
+                    .into()
+            } else {
+                0
+            };
+
+            match *instr {
                 Instr::Trap(trap_code) => self.execute_trap(trap_code)?,
                 Instr::ConsumeFuel(block_fuel) => self.execute_consume_fuel(block_fuel)?,
                 Instr::Return => {
@@ -859,6 +974,13 @@ impl<'ctx, 'engine> Executor<'ctx, 'engine> {
                 | Instr::CallIndirectParams(_)
                 | Instr::CallIndirectParamsImm16(_) => self.invalid_instruction_word()?,
             }
+
+            if self.tracer.is_some() {
+                if let Some(tracer) = self.get_tracer_if_active() {
+                    let mut tracer = tracer.borrow_mut();
+                    self.execute_instruction_post(pages, pre_sp, instr, &mut tracer);
+                }
+            }
         }
     }
 
@@ -877,7 +999,7 @@ impl<'ctx, 'engine> Executor<'ctx, 'engine> {
     }
 
     /// Sets the [`Register`] value to `value`.
-    fn set_register(&mut self, register: Register, value: impl Into<UntypedVal>) {
+    fn set_register(&mut self, register: Register, value: impl Into<UntypedVal> + Debug) {
         // Safety: TODO
         unsafe { self.sp.set(register, value.into()) };
     }

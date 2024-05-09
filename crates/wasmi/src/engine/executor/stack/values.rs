@@ -395,6 +395,7 @@ impl From<BaseValueStackOffset> for usize {
 /// Accessor to the [`Register`] values of a [`CallFrame`] on the [`CallStack`].
 ///
 /// [`CallStack`]: [`super::CallStack`]
+#[derive(Clone, Copy)]
 pub struct FrameRegisters {
     /// The underlying raw pointer to a [`CallFrame`] on the [`ValueStack`].
     ptr: *mut UntypedVal,
@@ -435,5 +436,9 @@ impl FrameRegisters {
     /// Returns the underlying pointer offset by the [`Register`] index.
     unsafe fn register_offset(&self, register: Register) -> *mut UntypedVal {
         unsafe { self.ptr.offset(register.to_i16() as isize) }
+    }
+
+    pub unsafe fn get_addr(&self, register: Register) -> usize {
+        self.register_offset(register) as usize
     }
 }

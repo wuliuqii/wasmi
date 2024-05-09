@@ -5,7 +5,7 @@ pub mod bytecode;
 mod cache;
 mod code_map;
 mod config;
-mod executor;
+pub(crate) mod executor;
 mod func_args;
 mod func_types;
 mod limits;
@@ -54,10 +54,13 @@ use crate::{
     Func,
     FuncType,
     StoreContextMut,
+    Tracer,
 };
 use core::sync::atomic::{AtomicU32, Ordering};
 use spin::{Mutex, RwLock};
 use std::{
+    cell::RefCell,
+    rc::Rc,
     sync::{Arc, Weak},
     vec::Vec,
 };
@@ -388,6 +391,41 @@ impl Engine {
         Results: CallResults,
     {
         self.inner.execute_func(ctx, func, params, results)
+    }
+
+    /// Executes the given [`Func`] with parameters `params`.
+    ///
+    /// Stores the execution result into `results` upon a successful execution.
+    ///
+    /// # Note
+    ///
+    /// - Assumes that the `params` and `results` are well typed.
+    ///   Type checks are done at the [`Func::call`] API or when creating
+    ///   a new [`TypedFunc`] instance via [`Func::typed`].
+    /// - The `params` out parameter is in a valid but unspecified state if this
+    ///   function returns with an error.
+    ///
+    /// # Errors
+    ///
+    /// - If `params` are overflowing or underflowing the expected amount of parameters.
+    /// - If the given `results` do not match the the length of the expected results of `func`.
+    /// - When encountering a Wasm or host trap during the execution of `func`.
+    ///
+    /// [`TypedFunc`]: [`crate::TypedFunc`]
+    #[inline]
+    pub(crate) fn execute_func_with_trace<T, Results>(
+        &self,
+        ctx: StoreContextMut<T>,
+        func: &Func,
+        params: impl CallParams,
+        results: Results,
+        tracer: Rc<RefCell<Tracer>>,
+    ) -> Result<<Results as CallResults>::Results, Error>
+    where
+        Results: CallResults,
+    {
+        self.inner
+            .execute_func_with_trace(ctx, func, params, results, tracer)
     }
 
     /// Executes the given [`Func`] resumably with parameters `params` and returns.

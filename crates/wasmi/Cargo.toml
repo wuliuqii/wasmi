@@ -11,21 +11,16 @@ readme.workspace = true
 license.workspace = true
 keywords.workspace = true
 categories.workspace = true
-exclude = [
-    "benches/wat",
-    "benches/wasm",
-    "tests/spec/testsuite",
-    "**.wast",
-]
+exclude = ["benches/wat", "benches/wasm", "tests/spec/testsuite", "**.wast"]
 
 [dependencies]
 wasmparser = { version = "0.100.2", package = "wasmparser-nostd", default-features = false }
 wasmi_core = { workspace = true }
 wasmi_collections = { workspace = true }
 spin = { version = "0.9", default-features = false, features = [
-    "mutex",
-    "spin_mutex",
-    "rwlock",
+  "mutex",
+  "spin_mutex",
+  "rwlock",
 ] }
 smallvec = { version = "1.13.1", features = ["union"] }
 multi-stash = { version = "0.2.0" }
@@ -43,15 +38,15 @@ criterion = { version = "0.5", default-features = false }
 [features]
 default = ["std"]
 std = [
-    "wasmi_core/std",
-    "wasmi_collections/std",
-    "wasmparser/std",
-    "spin/std",
-    "num-traits/std",
-    "arrayvec/std",
+  "wasmi_core/std",
+  "wasmi_collections/std",
+  "wasmparser/std",
+  "spin/std",
+  "num-traits/std",
+  "arrayvec/std",
 ]
 # Tells the `wasmi` crate to avoid using hash based data structures.
-# 
+#
 # Some embedded environments cannot provide a random source which is required
 # to properly initialize hashmap based data structures for resilience against
 # malious actors that control their inputs.

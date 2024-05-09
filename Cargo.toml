@@ -1,11 +1,11 @@
 [workspace]
 members = [
-    "crates/collections",
-    "crates/cli",
-    "crates/core",
-    "crates/wasmi",
-    "crates/wasi",
-    "fuzz",
+  "crates/collections",
+  "crates/cli",
+  "crates/core",
+  "crates/wasmi",
+  "crates/wasi",
+  "fuzz",
 ]
 exclude = []
 resolver = "2"
