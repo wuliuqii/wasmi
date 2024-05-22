@@ -1,3 +1,4 @@
+use core::fmt::Display;
 use std::{println, vec, vec::Vec};
 
 use crate::{
@@ -12,11 +13,31 @@ pub enum LocationType {
     Global,
 }
 
+impl Display for LocationType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LocationType::Stack => write!(f, "Stack"),
+            LocationType::Heap => write!(f, "Heap"),
+            LocationType::Global => write!(f, "Global"),
+        }
+    }
+}
+
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub enum AccessType {
     Read,
     Write,
     Init,
+}
+
+impl Display for AccessType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AccessType::Read => write!(f, "Read"),
+            AccessType::Write => write!(f, "Write"),
+            AccessType::Init => write!(f, "Init"),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -30,6 +51,16 @@ pub struct MemoryTableEntry {
     pub value: Val,
 }
 
+impl Display for MemoryTableEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{:7} {:8} {:8} {:6} {:5} {:5} {:?}",
+            self.eid, self.emid, self.addr, self.ltype, self.atype, self.is_mutable, self.value
+        )
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct MTable(Vec<MemoryTableEntry>);
 
@@ -40,6 +71,17 @@ impl MTable {
 
     pub fn entries(&self) -> &Vec<MemoryTableEntry> {
         &self.0
+    }
+
+    pub fn show(&self) {
+        println!(
+            "{:7} {:8} {:8} {:6} {:5} {:5} value",
+            "eid", "emid", "addr", "ltype", "atype", "is_mutable",
+        );
+
+        for entry in self.entries() {
+            println!("{}", entry);
+        }
     }
 }
 

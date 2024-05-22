@@ -85,4 +85,9 @@ impl Tracer {
 
         MTable::new(mentries)
     }
+
+    pub fn show(&self) {
+        self.get_mtable().show();
+        self.etable.show();
+    }
 }
